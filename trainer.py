@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from blinky import Blinky
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from processor import BlinkyProcessor
 import gc
 from types import SimpleNamespace
@@ -33,7 +33,7 @@ config = SimpleNamespace(
 model = Blinky(config)
 model.prepare_for_training()
 
-stage1_sd = torch.load('./Blinky/stage1.pt',weights_only=True)
+stage1_sd = torch.load('./Blinky/blinky2-llava.pt',weights_only=True)
 model.load_state_dict(stage1_sd)
 
 # RLAIF-V-Dataset
@@ -42,7 +42,7 @@ dataset = load_dataset('openbmb/RLAIF-V-Dataset')['train']
 
 
 origins = pd.DataFrame({'origin': dataset['origin_dataset']})
-train_idxs, valid_idxs = train_test_split(origins, stratify=origins['origin'], test_size=0.015, random_state=2025)
+train_idxs, valid_idxs = train_test_split(origins, stratify=origins['origin'], test_size=0.015, random_state=1357)
 print(len(train_idxs), len(valid_idxs))
 
 train_dataset = dataset.select(train_idxs.index)
@@ -64,24 +64,28 @@ train_dataset = train_dataset.remove_columns(
     ['ds_name', 'question', 'chosen', 'rejected', 'origin_dataset', 'origin_split', 'idx', 'image_path']
 )
 
-# def preprocess_llava(samples):
-#     conversations = samples['conversations']
-#     conversations = [ast.literal_eval(c.replace('<image>','').strip()) for c in conversations]
-#     updated_conversations = []
-#     for conversation in conversations:
-#         updated_conversation = [{
-#             'role': 'user' if c['from']=='human' else 'assistant',
-#             'content': c['value'].strip()
-#         } for c in conversation]
-#         updated_conversations.append(updated_conversation)
-#     samples['conversations'] = updated_conversations
-#     return samples
+def preprocess_llava(samples):
+    conversations = samples['conversations']
+    conversations = [ast.literal_eval(c.replace('<image>','').strip()) for c in conversations]
+    updated_conversations = []
+    for conversation in conversations:
+        updated_conversation = [{
+            'role': 'user' if c['from']=='human' else 'assistant',
+            'content': c['value'].strip()
+        } for c in conversation]
+        updated_conversations.append(updated_conversation)
+    samples['conversations'] = updated_conversations
+    return samples
 
-# dataset = load_dataset("theblackcat102/llava-instruct-mix")['train']
-# dataset = dataset.map(preprocess_llava,batched=True,num_proc=8,batch_size=512)
-# train_dataset = dataset.rename_column('conversations','text')
+dataset = load_dataset("theblackcat102/llava-instruct-mix")['train']
+dataset = dataset.map(preprocess_llava,batched=True,num_proc=8,batch_size=512)
+train_dataset2 = dataset.rename_column('conversations','text')
+
+# train_dataset = concatenate_datasets([train_dataset,train_dataset2]).shuffle()
+
 
 processor = BlinkyProcessor('./Blinky')
+
 
 def collate_fn(samples):
     inputs = processor(samples)
@@ -134,12 +138,19 @@ dataloader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size = 8,
     shuffle = True,
-    collate_fn = collate_fn,
+    collate_fn = collate_fn_for_completion_only,
     num_workers = 6,
     pin_memory = True
 )
 
-def get_optimizer(model, vision_lr=1e-5, vision_proj_lr=1e-3, text_lr=1e-5):
+
+sample = next(iter(dataloader))
+print(sample['input_ids'][0])
+print(sample['labels'][0])
+print(sample['attention_mask'][0])
+print({k:v.shape for k,v in sample.items()})
+
+def get_optimizer(model, vision_lr=1.5e-5, vision_proj_lr=1e-3, text_lr=1.5e-5):
 
     model._vision_trainable(trainable=False)
     model._text_trainable(trainable=False)
@@ -148,12 +159,12 @@ def get_optimizer(model, vision_lr=1e-5, vision_proj_lr=1e-3, text_lr=1e-5):
     vision_proj_params = []
     text_params = []
 
-    for p in model.vision.parameters():
-        vision_params.append(p)
-
     for p in model.vision_proj.parameters():
         p.requires_grad = True
         vision_proj_params.append(p)
+
+    for p in model.vision.parameters():
+        vision_params.append(p)
 
     for n,p in model.text_model.named_parameters():
         text_params.append(p)
@@ -164,7 +175,7 @@ def get_optimizer(model, vision_lr=1e-5, vision_proj_lr=1e-3, text_lr=1e-5):
         {'params': text_params, 'lr': text_lr},
     ]
 
-    optimizer = torch.optim.Adam(param_groups)
+    optimizer = torch.optim.AdamW(param_groups)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -175,18 +186,19 @@ def get_optimizer(model, vision_lr=1e-5, vision_proj_lr=1e-3, text_lr=1e-5):
 
 losses = []
 log_steps = 200
-epochs = 3
-
+epochs = 2
 
 unfreeze_text_pct = 0.
 unfreeze_vision_pct = 0.
 
-optim = get_optimizer(model,vision_proj_lr=1e-4 if unfreeze_vision_pct == 0 else 1e-3)
+# optim = get_optimizer(model)
+#stage2
+optim = torch.optim.Adam(model.parameters(),lr=2e-5)
 sched = torch.optim.lr_scheduler.OneCycleLR(
     optim,
-    max_lr=[pg['lr'] for pg in optim.param_groups],
+    max_lr=2e-5,
     total_steps=len(dataloader)*epochs,
-    pct_start=0.25
+    pct_start=0.1
 )
 print(optim)
 
@@ -223,7 +235,7 @@ for epoch in tqdm(range(epochs)):
             print('\n\n\t\tunfreezing vision\n\n',sum(p.numel() for p in model.parameters() if p.requires_grad))
         if global_step % checkpoint_steps == 0:
             sd = model.state_dict()
-            torch.save(sd,'./Blinky/model-checkpoint-stage2.pt')
+            torch.save(sd,'./Blinky/blinky2-sft-ckpt.pt')
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -231,7 +243,7 @@ for epoch in tqdm(range(epochs)):
 fig=plt.figure()
 plt.plot(losses)
 plt.title('loss')
-fig.savefig('losses_stage2.png')
+fig.savefig('losses_new-sft.png')
 
 sd = model.state_dict()
-torch.save(sd,'./Blinky/stage2.pt')
+torch.save(sd,'./Blinky/blinky2-sft.pt')

@@ -11,19 +11,21 @@ class VisionProjector(nn.Module):
     def __init__(self, vision_dim, proj_dim, dtype):
         super().__init__()
         self.embed_dim = vision_dim
-        self.intermediate_dim = self.embed_dim * 2
+        # self.intermediate_dim = self.embed_dim * 2
         self.proj_dim = proj_dim
-        self.gate_proj = nn.Linear(self.embed_dim, self.intermediate_dim, bias=False, dtype=dtype)
-        self.up_proj = nn.Linear(self.embed_dim, self.intermediate_dim, bias=False, dtype=dtype)
-        self.down_proj = nn.Linear(self.intermediate_dim, self.proj_dim, bias=False, dtype=dtype)
-        self.act_fn = SiLU()
+        # self.gate_proj = nn.Linear(self.embed_dim, self.intermediate_dim, bias=False, dtype=dtype)
+        # self.up_proj = nn.Linear(self.embed_dim, self.intermediate_dim, bias=False, dtype=dtype)
+        # self.down_proj = nn.Linear(self.intermediate_dim, self.proj_dim, bias=False, dtype=dtype)
+        # self.act_fn = SiLU()
+        self.proj = nn.Linear(self.embed_dim, self.proj_dim, bias=False, dtype=dtype)
 
     def forward(self, x):
         # x [B S D]
-        x1 = self.gate_proj(x)
-        x2 = self.up_proj(x)
-        x = self.act_fn(x1) * x2
-        x = self.down_proj(x)
+        # x1 = self.gate_proj(x)
+        # x2 = self.up_proj(x)
+        # x = self.act_fn(x1) * x2
+        # x = self.down_proj(x)
+        x = self.proj(x)
         return x
 
 
@@ -36,6 +38,7 @@ class Blinky(nn.Module):
         self.config.vision_config = SimpleNamespace(**vision_config.to_dict())
 
         self.vision = SiglipVisionModel(vision_config).to(dtype=self.config.dtype)
+
         self.vision_proj = VisionProjector(self.config.vision_config.hidden_size, self.config.embed_dim, dtype=self.config.dtype)
         self.text_model = LLaMA(self.config)
 
@@ -87,6 +90,7 @@ class Blinky(nn.Module):
 
         x = self.text_model.embed_tokens(input_ids)
 
+        image_tokens = None
         if pixel_values is not None:
             image_tokens = self.forward_image_features(pixel_values)
             x = torch.cat([image_tokens, x.detach()], dim=1)
@@ -107,7 +111,7 @@ class Blinky(nn.Module):
         logits = self.text_model.lm_head(x)
 
         if labels is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
             return loss
 
         return logits
